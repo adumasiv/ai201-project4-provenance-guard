@@ -74,8 +74,36 @@ Using two signals matters: if the LLM signal alone fired, the system could be fo
 
 | Endpoint | Limit | Reasoning |
 |---|---|---|
-| `POST /analyze` | 10 requests / minute / IP | Each request calls an external LLM API, making it non-trivial in cost and latency. 10/min is generous for interactive use while blocking automated scraping or abuse. |
-| `POST /appeal/<content_id>` | 20 requests / minute / IP | Appeals are cheaper (no LLM call) but still bounded to prevent flooding a single content record. |
+| `POST /submit` | **10 requests / minute / IP** | Each request calls the Groq LLM API, making it non-trivial in cost and latency. A writer submitting their own work would rarely need more than 1–2 requests per minute; 10 is generous for legitimate use while blocking automated scraping. A script flooding the system hits the cap after 10 requests and receives 429s for the rest of the minute. |
+| `POST /appeal` | **20 requests / minute / IP** | Appeals involve no LLM call (cheap), but are bounded to prevent a script from flooding a single content record or spamming the audit log. 20/min is more than sufficient for any human workflow. |
+| `GET /log` | **No limit** | Read-only, no external calls, no write side-effects. |
+
+### Rate limit evidence
+
+Running 12 rapid requests against `POST /submit` (limit: 10/min):
+
+```
+200   ← request 1
+200   ← request 2
+200   ← request 3
+200   ← request 4
+200   ← request 5
+200   ← request 6
+200   ← request 7
+200   ← request 8
+200   ← request 9
+200   ← request 10
+429   ← request 11 (limit exceeded)
+429   ← request 12 (limit exceeded)
+```
+
+429 response body:
+```json
+{
+    "error": "rate_limit_exceeded",
+    "message": "Too many requests. Please slow down."
+}
+```
 
 ---
 
@@ -101,17 +129,103 @@ No automated re-classification occurs. The appeal is a data record for human rev
 
 ## Audit Log
 
-Every attribution decision is captured as a structured record. Retrieve via `GET /log`.
+Every attribution decision is captured as a structured JSON record before the response is returned. Retrieve via `GET /log`. Supports `?status=decided|under_review` and `?limit=N` query params.
 
 Each record contains:
-- `content_id` — UUID assigned at submission
-- `submitted_at` — ISO 8601 timestamp
-- `classification` — `ai_generated`, `human_written`, or `uncertain`
-- `confidence_score` — raw float (0.0–1.0)
-- `signals_used` — array of `{name, score}` for each signal
-- `label` — the full label object shown to the reader
-- `status` — `decided` or `under_review`
-- `appeal` — `null` or `{reason, creator_id, appealed_at}`
+
+| Field | Type | Description |
+|---|---|---|
+| `content_id` | string | UUID assigned at submission |
+| `timestamp` | string | ISO 8601 UTC timestamp |
+| `creator_id` | string\|null | Submitter identifier (optional) |
+| `attribution` | string | `ai_generated`, `human_written`, or `uncertain` |
+| `confidence` | float | Combined score (0.0–1.0) |
+| `llm_score` | float | Groq/Llama signal score (0.0–1.0, or -1.0 if failed) |
+| `heuristic_score` | float | Statistical signal score (0.0–1.0) |
+| `signals_used` | array | `[{name, score}]` — both signals listed individually |
+| `label` | object | Full label shown to readers, including `appeal_notice` after appeal |
+| `status` | string | `decided` or `under_review` |
+| `appeal` | object\|null | `null` until appealed; then `{reason, creator_id, appealed_at}` |
+
+### Sample `GET /log` output (3 entries)
+
+```json
+{
+  "count": 3,
+  "entries": [
+    {
+      "appeal": null,
+      "attribution": "uncertain",
+      "confidence": 0.6162,
+      "content_id": "0379e6bc-ab5a-4462-abad-d07a76ecca76",
+      "creator_id": "test-academic",
+      "heuristic_score": 0.275,
+      "label": {
+        "appeal_cta": null,
+        "appeal_notice": null,
+        "confidence_text": "Our system could not confidently determine the origin of this content.",
+        "explanation": "This content could not be confidently attributed to either a human or an AI. Our two signals did not agree strongly enough to reach a verdict. This label should not be treated as an accusation or a clearance.",
+        "verdict": "Origin unclear"
+      },
+      "llm_score": 0.8,
+      "signals_used": [
+        {"name": "llm_classifier", "score": 0.8},
+        {"name": "heuristic", "score": 0.275}
+      ],
+      "status": "decided",
+      "timestamp": "2026-07-01T04:49:08.364380+00:00"
+    },
+    {
+      "appeal": null,
+      "attribution": "human_written",
+      "confidence": 0.2158,
+      "content_id": "7e0f7508-5514-42b9-9629-d1987ef42218",
+      "creator_id": "test-human",
+      "heuristic_score": 0.2267,
+      "label": {
+        "appeal_cta": null,
+        "appeal_notice": null,
+        "confidence_text": "Our system is 78% confident this content was written by a human.",
+        "explanation": "This content shows patterns consistent with human authorship. Our system evaluated it using two independent signals — a language model classifier and a statistical analyzer — and neither detected significant markers of AI generation.",
+        "verdict": "Likely human-written"
+      },
+      "llm_score": 0.21,
+      "signals_used": [
+        {"name": "llm_classifier", "score": 0.21},
+        {"name": "heuristic", "score": 0.2267}
+      ],
+      "status": "decided",
+      "timestamp": "2026-07-01T04:49:08.255730+00:00"
+    },
+    {
+      "appeal": {
+        "appealed_at": "2026-07-01T04:49:08.509752+00:00",
+        "creator_id": "test-ai",
+        "reason": "I wrote this myself. The structured format reflects my academic background, not AI generation."
+      },
+      "attribution": "ai_generated",
+      "confidence": 0.7743,
+      "content_id": "428b2cd1-1000-48da-bae0-e3e991ad06a8",
+      "creator_id": "test-ai",
+      "heuristic_score": 0.7265,
+      "label": {
+        "appeal_cta": "Think this is wrong? Creators can contest this classification.",
+        "appeal_notice": "This classification is under review following a creator appeal. The verdict above may change.",
+        "confidence_text": "Our system is 77% confident this content was AI-generated.",
+        "explanation": "This content shows patterns consistent with AI-generated text. Our system evaluated it using two independent signals — a language model classifier and a statistical analyzer — and both indicate AI authorship.",
+        "verdict": "AI-generated"
+      },
+      "llm_score": 0.8,
+      "signals_used": [
+        {"name": "llm_classifier", "score": 0.8},
+        {"name": "heuristic", "score": 0.7265}
+      ],
+      "status": "under_review",
+      "timestamp": "2026-07-01T04:49:08.015551+00:00"
+    }
+  ]
+}
+```
 
 ---
 

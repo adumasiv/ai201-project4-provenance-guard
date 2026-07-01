@@ -9,7 +9,8 @@ from flask_limiter.util import get_remote_address
 load_dotenv()
 
 import audit
-from pipeline.llm_signal import run_llm_signal  # noqa: E402
+from labels import generate_label
+from pipeline.pipeline import run_pipeline  # noqa: E402
 
 app = Flask(__name__)
 
@@ -32,7 +33,6 @@ def _validate_submission(data: dict):
             "error":   "missing_field",
             "message": "Request body must include a non-empty 'text' field.",
         }), 400)
-
     text = data["text"]
     if len(text) < 50:
         return None, None, (jsonify({
@@ -44,11 +44,11 @@ def _validate_submission(data: dict):
             "error":   "text_too_long",
             "message": "Text must not exceed 10,000 characters.",
         }), 400)
-
     creator_id = data.get("creator_id") or None
-
     return text, creator_id, None
 
+
+# ── Submission ────────────────────────────────────────────────────────────────
 
 @app.route("/submit", methods=["POST"])
 @limiter.limit("10 per minute")
@@ -58,42 +58,31 @@ def submit():
     if err:
         return err
 
-    content_id = str(uuid.uuid4())
+    content_id   = str(uuid.uuid4())
     submitted_at = _now()
 
-    llm_score = run_llm_signal(text)
+    result     = run_pipeline(text)
+    attribution = result["classification"]
+    confidence  = result["confidence_score"]
+    signals     = result["signals_used"]
 
-    # Single-signal confidence: use llm_score directly until heuristic is wired in M4.
-    # -1.0 means the LLM call failed; fall back to 0.5 (unknown).
-    confidence = llm_score if llm_score >= 0 else 0.5
+    llm_score  = next(s["score"] for s in signals if s["name"] == "llm_classifier")
+    heur_score = next(s["score"] for s in signals if s["name"] == "heuristic")
 
-    if confidence >= 0.75:
-        attribution = "ai_generated"
-        label = "AI-generated (placeholder — full label in M5)"
-    elif confidence <= 0.35:
-        attribution = "human_written"
-        label = "Likely human-written (placeholder — full label in M5)"
-    else:
-        attribution = "uncertain"
-        label = "Origin unclear (placeholder — full label in M5)"
-
-    signals_used = [
-        {"name": "llm_classifier", "score": llm_score},
-        {"name": "heuristic",      "score": -1.0},   # wired in M4
-    ]
+    label = generate_label(attribution, confidence)
 
     record = {
-        "content_id":   content_id,
-        "creator_id":   creator_id,
-        "timestamp":    submitted_at,
-        "attribution":  attribution,
-        "confidence":   round(confidence, 4),
-        "llm_score":    llm_score,
-        "heuristic_score": -1.0,
-        "signals_used": signals_used,
-        "label":        label,
-        "status":       "decided",
-        "appeal":       None,
+        "content_id":      content_id,
+        "creator_id":      creator_id,
+        "timestamp":       submitted_at,
+        "attribution":     attribution,
+        "confidence":      confidence,
+        "llm_score":       llm_score,
+        "heuristic_score": heur_score,
+        "signals_used":    signals,
+        "label":           label,
+        "status":          "decided",
+        "appeal":          None,
     }
     audit.append_record(record)
 
@@ -102,12 +91,81 @@ def submit():
         "submitted_at": submitted_at,
         "creator_id":   creator_id,
         "attribution":  attribution,
-        "confidence":   round(confidence, 4),
+        "confidence":   confidence,
         "label":        label,
-        "signals_used": signals_used,
+        "signals_used": signals,
         "status":       "decided",
     }), 200
 
+
+# ── Appeals ───────────────────────────────────────────────────────────────────
+
+def _handle_appeal(content_id: str, reason: str, creator_id: str | None):
+    """Shared logic for both appeal routes."""
+    if not reason or len(reason) < 10:
+        return jsonify({
+            "error":   "missing_field",
+            "message": "A 'creator_reasoning' or 'reason' field is required (min 10 characters).",
+        }), 400
+    if len(reason) > 2000:
+        return jsonify({
+            "error":   "reason_too_long",
+            "message": "Reason must not exceed 2,000 characters.",
+        }), 400
+
+    record = audit.get_record(content_id)
+    if record is None:
+        return jsonify({
+            "error":   "content_not_found",
+            "message": "No content found with that ID.",
+        }), 404
+
+    if record.get("appeal") is not None:
+        return jsonify({
+            "error":   "already_appealed",
+            "message": "An appeal has already been submitted for this content.",
+        }), 409
+
+    appealed_at = _now()
+    audit.update_appeal(content_id, {
+        "reason":      reason,
+        "creator_id":  creator_id,
+        "appealed_at": appealed_at,
+    })
+
+    return jsonify({
+        "content_id":         content_id,
+        "status":             "under_review",
+        "appeal_received_at": appealed_at,
+    }), 200
+
+
+@app.route("/appeal", methods=["POST"])
+@limiter.limit("20 per minute")
+def appeal_flat():
+    """Flat appeal endpoint: content_id + creator_reasoning in the request body."""
+    data = request.get_json(silent=True) or {}
+    content_id = (data.get("content_id") or "").strip()
+    if not content_id:
+        return jsonify({
+            "error":   "missing_field",
+            "message": "Request body must include a 'content_id' field.",
+        }), 400
+    reason = (data.get("creator_reasoning") or data.get("reason") or "").strip()
+    creator_id = data.get("creator_id") or None
+    return _handle_appeal(content_id, reason, creator_id)
+
+
+@app.route("/appeal/<content_id>", methods=["POST"])
+@limiter.limit("20 per minute")
+def appeal(content_id):
+    data      = request.get_json(silent=True) or {}
+    reason    = (data.get("creator_reasoning") or data.get("reason") or "").strip()
+    creator_id = data.get("creator_id") or None
+    return _handle_appeal(content_id, reason, creator_id)
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
 
 @app.route("/log", methods=["GET"])
 def log():
@@ -122,11 +180,13 @@ def log():
     return jsonify({"count": len(entries), "entries": entries}), 200
 
 
+# ── Error handlers ────────────────────────────────────────────────────────────
+
 @app.errorhandler(429)
 def ratelimit_handler(e):
     return jsonify({
         "error":   "rate_limit_exceeded",
-        "message": "Too many requests. Limit: 10 per minute per IP.",
+        "message": "Too many requests. Please slow down.",
     }), 429
 
 

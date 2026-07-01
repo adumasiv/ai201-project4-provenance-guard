@@ -18,11 +18,16 @@ def get_record(content_id: str) -> dict | None:
 
 
 def update_appeal(content_id: str, appeal: dict) -> bool:
-    """Attach an appeal to an existing record. Returns False if not found."""
+    """Attach an appeal to an existing record and refresh the label's appeal_notice."""
+    from labels import generate_label
     for entry in _log:
         if entry.get("content_id") == content_id:
-            entry["appeal"] = appeal
-            entry["status"] = "under_review"
+            entry["appeal"]  = appeal
+            entry["status"]  = "under_review"
+            # Regenerate the label so appeal_notice is populated in the log.
+            entry["label"] = generate_label(
+                entry["attribution"], entry["confidence"], status="under_review"
+            )
             return True
     return False
 
